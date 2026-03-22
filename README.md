@@ -27,6 +27,7 @@ Habitat analysis is an emerging radiomics technique that subdivides a tumour ROI
 
 **Train** on a directory of NIfTI images and masks:
 
+```
 │   ├── train.py                    # habitat-train entry point
 │   └── infer.py                    # habitat-infer entry point
 ├── examples/
