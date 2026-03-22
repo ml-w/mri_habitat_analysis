@@ -25,6 +25,14 @@ Habitat analysis is an emerging radiomics technique that subdivides a tumour ROI
 
 ## Quick start — CLI
 
+**Install**
+
+```bash
+git clone https://github.com/ml-w/mri_habitat_analysis
+cd mri_habitat_analysis
+uv sync python=3.9
+```
+
 **Train** on a directory of NIfTI images and masks:
 
 ```
@@ -56,8 +64,10 @@ Defines the mnts `MNTSFilterGraph`:
 SpatialNorm (resample to 0.4492 mm in-plane)
   └─► HuangThresholding (auto-mask)
         └─► N4ITKBiasFieldCorrection
-              └─► NyulNormalizer  ← requires training
+              └─► NyulNormalizer  ← requires training & brain mask
 ```
+
+See more information in the original repo [here](https://github.com/alabamagan/mri_normalization_tools).
 
 ### `configs/pyradiomics_habitat.yaml`
 
