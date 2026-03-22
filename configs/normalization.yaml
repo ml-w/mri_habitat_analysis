@@ -1,0 +1,23 @@
+# mnts MNTSFilterGraph configuration for MRI normalisation
+# Pipeline: SpatialNorm -> HuangThresholding -> N4ITKBiasFieldCorrection -> NyulNormalizer
+#
+# Node indices (0-based) determine upstream connections.
+# is_exit: True marks nodes whose outputs are written to disk.
+
+SpatialNorm:
+    out_spacing: [0.4492, 0.4492, 0]   # in-plane resampling to match pyradiomics default; 0 = keep slice thickness
+
+HuangThresholding:
+    closing_kernel_size: 10
+    _ext:
+        upstream: 0
+        is_exit: True                   # save thresholded mask
+
+N4ITKBiasFieldCorrection:
+    _ext:
+        upstream: [0, 1]               # image from SpatialNorm, mask from HuangThresholding
+
+NyulNormalizer:
+    _ext:
+        upstream: [2, 1]               # image from N4ITK, mask from HuangThresholding
+        is_exit: True                  # save normalised image

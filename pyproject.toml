@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "habitat-analysis"
+version = "0.1.0"
+description = "Radiomics habitat analysis pipeline for NPC on MRI"
+requires-python = ">=3.9, <3.10"
+dependencies = [
+    "pyradiomics>=3.0.1",
+    "mri-normalization-tools>=0.1",
+    "SimpleITK>=2.1.1",
+    "scikit-learn>=1.0.1",
+    "scipy>=1.7.0",
+    "numpy<2.0",
+    "matplotlib>=3.4.0",
+    "joblib>=1.0.0",
+    "tqdm>=4.60.0",
+    "pyyaml>=5.4.0",
+    "click>=8.0.0",
+    "ipython>=7.0.0",
+    "pandas>=1.3.0",
+    "openpyxl>=3.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff",
+]
+
+[project.scripts]
+habitat-train = "scripts.train:main"
+habitat-infer = "scripts.infer:main"
+
+[tool.setuptools.packages.find]
+include = ["habitat_analysis*", "scripts*"]
+
+[tool.uv.sources]
+mri-normalization-tools = { git = "https://github.com/alabamagan/mri_normalization_tools" }

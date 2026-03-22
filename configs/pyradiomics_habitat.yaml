@@ -1,0 +1,41 @@
+# PyRadiomics configuration for habitat analysis
+# Wavelets are explicitly excluded — they produce many redundant bands and
+# inflate the feature vector without improving clustering.
+# Only first-order statistics are extracted; shape features are irrelevant
+# at the pixelwise level.
+
+imageType:
+  Original: {}
+  LBP2D:
+    binWidth: 0.25
+    lbp2DRadius: 0.9
+    lbp2DMethod: 'default'
+    force2D: True
+  LBP3D:
+    binWidth: 0.25
+    lbp3DIcosphereRadius: 0.9
+  LoG:
+    sigma: [0.4492, 1.0, 2.0]
+  Gradient: {}
+  Exponential: {}
+
+featureClass:
+  firstorder:
+    - Energy
+    - Entropy
+    - Kurtosis
+    - Maximum
+    - Mean
+    - MeanAbsoluteDeviation
+    - RobustMeanAbsoluteDeviation
+    - RootMeanSquared
+    - Skewness
+    - Uniformity
+    - Variance
+
+setting:
+  resampledPixelSpacing: [0.4492, 0.4492, 0.4492]
+  binWidth: 1
+  preCrop: True
+  # Disable shape and texture classes — only image-type filter outputs are needed
+  # for pixelwise feature map construction
