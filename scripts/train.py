@@ -20,8 +20,17 @@ sequences are provided at inference time.
 """
 
 from pathlib import Path
+from typing import Optional
 
 import click
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich import box
+
+from habitat_analysis.pipeline import HabitatPipeline
+
+console = Console()
 
 
 def _parse_seq_option(param, values) -> dict:
@@ -49,27 +58,27 @@ def _parse_seq_option(param, values) -> dict:
          "E.g. --seq T1:/data/T1 --seq T2:/data/T2",
 )
 @click.option(
-    "--img_dir", default=None,
+    "--img-dir", default=None,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Single-sequence image directory (alias for --seq image:DIR).",
 )
 @click.option(
-    "--mask_dir", required=True,
+    "--mask-dir", required=True,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
     help="Directory of binary mask NIfTI files.",
 )
 @click.option(
     "--out", required=True,
-    type=click.Path(dir_okay=False, path_type=Path),
-    help="Output state archive path (.zip).",
+    type=click.Path(path_type=Path),
+    help="Output state path — a .zip archive if the suffix is .zip, otherwise a plain directory.",
 )
 @click.option(
-    "--norm_config", default=None,
+    "--norm-config", default=None,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="mnts normalisation YAML (default: bundled).",
 )
 @click.option(
-    "--pyrad_config", default=None,
+    "--pyrad-config", default=None,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="PyRadiomics filter YAML (default: bundled).",
 )
@@ -78,19 +87,50 @@ def _parse_seq_option(param, values) -> dict:
     type=click.Choice(["kmeans", "gmm"]),
     help="Clustering algorithm.",
 )
-@click.option("--k_min", default=2, type=int, show_default=True,
-              help="Minimum number of clusters to evaluate.")
-@click.option("--k_max", default=6, type=int, show_default=True,
-              help="Maximum number of clusters to evaluate (inclusive).")
-@click.option("--subsample", default=200_000, type=int, show_default=True,
-              help="Max voxels for clustering fit (0 = use all).")
+@click.option(
+    "--k-min", default=2, type=int, show_default=True,
+    help="Minimum number of clusters to evaluate."
+)
+@click.option(
+    "--k-max", default=6, type=int, show_default=True,
+    help="Maximum number of clusters to evaluate (inclusive)."
+)
+@click.option(
+    "--subsample", default=200_000, type=int, show_default=True,
+    help="Max voxels for clustering fit (0 = use all)."
+)
 @click.option("--seed", default=42, type=int, show_default=True,
               help="Random seed.")
-@click.option("--id_globber", default=r"^[0-9a-zA-Z]+", show_default=True,
+@click.option("--id-globber", default=r"^[0-9a-zA-Z]+", show_default=True,
               help="Regex to extract case IDs from filenames.")
+@click.option("--skip-norm", is_flag=True,
+              help="Skip normalisation (use when images are already normalised).")
+@click.option(
+    "--seg-dir", default=None,
+    type=click.Path(path_type=Path),
+    help="Directory for output habitat segmentations (default: <out>_segmentations/ or <out>/segmentations/).",
+)
+@click.option("--debug", is_flag=True,
+              help="Debug mode: process only the first 3 cases.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable DEBUG logging.")
-def main(seq_tokens, img_dir, mask_dir, out, norm_config, pyrad_config,
-         method, k_min, k_max, subsample, seed, id_globber, verbose):
+def main(
+    seq_tokens: tuple,
+    img_dir: Path,
+    mask_dir: Path,
+    out: Path,
+    norm_config: Path,
+    pyrad_config: Path,
+    method: str,
+    k_min: int,
+    k_max: int,
+    subsample: int,
+    seed: int,
+    id_globber: str,
+    skip_norm: bool,
+    seg_dir: Optional[Path],
+    debug: bool,
+    verbose: bool,
+):
     """Train the habitat analysis pipeline and save the state archive."""
     from mnts.mnts_logger import MNTSLogger
     MNTSLogger("habitat_train.log", logger_name="habitat_train",
@@ -106,20 +146,29 @@ def main(seq_tokens, img_dir, mask_dir, out, norm_config, pyrad_config,
         seq_dirs = {"image": img_dir}
     else:
         seq_dirs = _parse_seq_option(None, seq_tokens)
-
+        
     if not seq_dirs:
         raise click.UsageError("No valid sequence directories were parsed.")
 
-    primary_img_dir = next(iter(seq_dirs.values()))
-    seq_names = list(seq_dirs.keys())
+    # ── Print run configuration ───────────────────────────────────────────────
+    cfg_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    cfg_table.add_column(style="bold cyan", no_wrap=True)
+    cfg_table.add_column()
 
-    click.echo(f"Sequences            : {', '.join(f'{k}={v}' for k, v in seq_dirs.items())}")
-    click.echo(f"Mask directory       : {mask_dir}")
-    click.echo(f"Output state         : {out}")
+    for seq_name, seq_path in seq_dirs.items():
+        cfg_table.add_row(f"Sequence [{seq_name}]", str(seq_path))
+    cfg_table.add_row("Mask directory", str(mask_dir))
+    cfg_table.add_row("Output state", str(out))
+    cfg_table.add_row("Method", method)
+    cfg_table.add_row("k range", f"{k_min}–{k_max}")
+    cfg_table.add_row("Subsample", str(subsample) if subsample > 0 else "all")
+    cfg_table.add_row("Skip norm", "yes" if skip_norm else "no")
+    if debug:
+        cfg_table.add_row("Debug mode", "[bold yellow]ON — first 3 cases only[/bold yellow]")
+
+    console.print(Panel(cfg_table, title="[bold]Habitat Training", border_style="blue"))
 
     # ── Run pipeline ──────────────────────────────────────────────────────────
-    from habitat_analysis.pipeline import HabitatPipeline
-
     pipeline = HabitatPipeline(
         norm_config=norm_config,
         pyrad_config=pyrad_config,
@@ -129,16 +178,32 @@ def main(seq_tokens, img_dir, mask_dir, out, norm_config, pyrad_config,
         subsample=subsample if subsample > 0 else None,
         random_state=seed,
     )
+    # Default seg_dir: alongside state for zip, inside out dir otherwise
+    if seg_dir is None:
+        if out.suffix == ".zip":
+            seg_dir = out.parent / "clustered_labels"
+        else:
+            seg_dir = out / "clustered_labels"
+
     state = pipeline.train(
-        img_dir=primary_img_dir,
+        seq_dirs=seq_dirs,
         mask_dir=mask_dir,
         out_state=out,
-        extra_metadata={"sequences": seq_names},
+        out_seg_dir=seg_dir,
+        skip_norm=skip_norm,
+        max_cases=3 if debug else None,
     )
 
-    click.echo(f"\nState archive saved  : {out}")
-    click.echo(f"Required sequences   : {state.required_sequences}")
-    click.echo(f"Best k               : {state.metadata.get('best_k')}")
+    # ── Print results ─────────────────────────────────────────────────────────
+    res_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
+    res_table.add_column(style="bold green", no_wrap=True)
+    res_table.add_column()
+    res_table.add_row("State archive", str(out))
+    res_table.add_row("Segmentations", str(seg_dir))
+    res_table.add_row("Required sequences", ", ".join(state.required_sequences or ["-"]))
+    res_table.add_row("Best k", str(state.metadata.get("best_k")))
+
+    console.print(Panel(res_table, title="[bold]Training Complete", border_style="green"))
 
 
 if __name__ == "__main__":

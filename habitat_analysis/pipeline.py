@@ -1,73 +1,132 @@
 """
 Orchestration for habitat analysis training and inference.
 
-HabitatPipeline.train()  — normalise → extract features → cluster → save state
-HabitatPipeline.infer()  — load state → normalise → extract → predict → write outputs
+HabitatPipeline.train()  — normalise → extract → cluster → save state + features
+HabitatPipeline.infer()  — load state → normalise → extract (or use cache) → predict → write
 """
 
-import logging
+import re
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import pandas as pd
 import SimpleITK as sitk
-from tqdm import tqdm
+from rich.progress import track
 
 from .clusterer import HabitatClusterer
 from .feature_extractor import PixelwiseFeatureExtractor
+from .io_manager import HabitatIOManager
 from .normalizer import HabitatNormalizer
 from .state import HabitatState
 from .visualization import label_map_to_nifti, render_habitat_overlay
 
 from mnts.mnts_logger import MNTSLogger
 
-logger = MNTSLogger[__name__]
+logger: MNTSLogger = MNTSLogger[__name__]
 
 _DEFAULT_NORM_CONFIG = Path(__file__).parent.parent / "configs" / "normalization.yaml"
 _DEFAULT_PYRAD_CONFIG = Path(__file__).parent.parent / "configs" / "pyradiomics_habitat.yaml"
 
 
-def _match_pairs(img_dir: Path, mask_dir: Path, id_globber: str) -> List[Tuple[Path, Path]]:
-    """Return sorted (image_path, mask_path) pairs matched by case ID.
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    Falls back to alphabetical ordering if ID extraction fails.
+def _extract_id(path: Path, globber: str) -> str:
+    m = re.search(globber, path.name)
+    return m.group() if m else path.stem
+
+
+def _index_dir(directory: Path, globber: str) -> Dict[str, Path]:
+    """Return ``{case_id: path}`` for all ``.nii.gz`` files in *directory*."""
+    return {_extract_id(f, globber): f for f in sorted(directory.glob("*.nii.gz"))}
+
+
+def _common_ids(
+    seq_dirs: Dict[str, Path],
+    mask_dir: Path,
+    globber: str,
+) -> Tuple[List[str], Dict[str, Dict[str, Path]], Dict[str, Path]]:
+    """Find case IDs present in every sequence directory and the mask directory.
+
+    Returns:
+        common_ids: Sorted list of shared case IDs.
+        seq_by_id:  ``{case_id: {seq_name: img_path}}`` for every common ID.
+        mask_by_id: ``{case_id: mask_path}`` for every common ID.
     """
-    import re
+    mask_index = _index_dir(mask_dir, globber)
+    seq_indices = {seq: _index_dir(d, globber) for seq, d in seq_dirs.items()}
 
-    img_files = sorted(img_dir.glob("*.nii.gz"))
-    mask_files = sorted(mask_dir.glob("*.nii.gz"))
-
-    if len(img_files) != len(mask_files):
-        raise ValueError(
-            f"Number of images ({len(img_files)}) does not match masks ({len(mask_files)})."
-        )
-
-    def extract_id(p: Path) -> str:
-        m = re.search(id_globber, p.name)
-        return m.group() if m else p.stem
-
-    img_by_id = {extract_id(f): f for f in img_files}
-    mask_by_id = {extract_id(f): f for f in mask_files}
-    common = sorted(set(img_by_id) & set(mask_by_id))
+    # Intersect IDs across all sequences and masks
+    all_id_sets = [set(mask_index)] + [set(idx) for idx in seq_indices.values()]
+    common = sorted(set.intersection(*all_id_sets))
 
     if not common:
-        logger.warning("ID matching found no common IDs; falling back to alphabetical order.")
-        return list(zip(img_files, mask_files))
+        raise ValueError(
+            "No common case IDs found across sequences and masks. "
+            "Check id_globber and filenames."
+        )
 
-    return [(img_by_id[i], mask_by_id[i]) for i in common]
+    seq_by_id: Dict[str, Dict[str, Path]] = {
+        cid: {seq: seq_indices[seq][cid] for seq in seq_dirs}
+        for cid in common
+    }
+    mask_by_id = {cid: mask_index[cid] for cid in common}
+    return common, seq_by_id, mask_by_id
 
+
+def build_features_df(
+    features: np.ndarray,
+    io_manager: HabitatIOManager,
+    column_labels: List[str],
+) -> pd.DataFrame:
+    """Assemble the full voxel feature table from a combined feature matrix.
+
+    Args:
+        features: ``(N_total_voxels, N_features)`` float array.
+        io_manager: Populated :class:`~io_manager.HabitatIOManager`.
+        column_labels: Feature column names (``"{seq}__{filter}"`` format).
+
+    Returns:
+        DataFrame with columns ``case_id, z, y, x, <feature cols…>``.
+    """
+    case_ids: List[str] = []
+    coords_list: List[np.ndarray] = []
+
+    for case_id, rec in io_manager.records.items():
+        case_ids.extend([case_id] * rec.n_voxels)
+        coords_list.append(rec.voxel_indices)
+
+    coords = np.concatenate(coords_list, axis=0)  # (N_total, 3)
+
+    df = pd.DataFrame({
+        "case_id": case_ids,
+        "z": coords[:, 0].astype(np.int32),
+        "y": coords[:, 1].astype(np.int32),
+        "x": coords[:, 2].astype(np.int32),
+    })
+    for j, col in enumerate(column_labels):
+        df[col] = features[:, j].astype(np.float32)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
 
 class HabitatPipeline:
     """End-to-end habitat analysis pipeline.
 
     Args:
-        norm_config: Path to mnts normalisation YAML (default: bundled config).
-        pyrad_config: Path to pyradiomics YAML (default: bundled config).
+        norm_config: Path to mnts normalisation YAML (default: bundled).
+        pyrad_config: Path to pyradiomics YAML (default: bundled).
         id_globber: Regex to extract case IDs from filenames.
         cluster_method: ``"kmeans"`` or ``"gmm"``.
         k_range: Candidate cluster counts for the grid search.
-        subsample: Max voxels to use for clustering fit (None = use all).
+        subsample: Max voxels used for clustering fit (``None`` = use all).
         random_state: RNG seed.
     """
 
@@ -90,79 +149,143 @@ class HabitatPipeline:
         self.random_state = random_state
 
     # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_seq_dirs(
+        self,
+        seq_dirs: Union[Dict[str, Union[str, Path]], str, Path],
+    ) -> Dict[str, Path]:
+        """Accept a dict of sequences or a plain path (single-sequence compat)."""
+        if isinstance(seq_dirs, (str, Path)):
+            return {"image": Path(seq_dirs)}
+        return {k: Path(v) for k, v in seq_dirs.items()}
+
+    # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
     def train(
         self,
-        img_dir: Union[str, Path],
+        seq_dirs: Union[Dict[str, Union[str, Path]], str, Path],
         mask_dir: Union[str, Path],
         out_state: Union[str, Path],
-        io_manager=None,
+        out_seg_dir: Optional[Union[str, Path]] = None,
+        io_manager: Optional[HabitatIOManager] = None,
         extra_metadata: Optional[dict] = None,
+        skip_norm: bool = False,
+        max_cases: Optional[int] = None,
     ) -> HabitatState:
-        """Train normalisation and clustering on a dataset and save the state.
+        """Train normalisation and clustering and save the state archive.
 
         Steps:
-            1. Train NyulNormalizer on *img_dir* / *mask_dir*.
-            2. Run normalisation inference to a temp directory.
-            3. Extract pixelwise feature matrices for all cases.
+            1. Train one NyulNormalizer per sequence  *(skipped if skip_norm)*.
+            2. Apply normalisation for all sequences  *(skipped if skip_norm)*.
+            3. Extract per-voxel multi-sequence features for every case.
             4. Fit :class:`~clusterer.HabitatClusterer` on the combined matrix.
-            5. Save :class:`~state.HabitatState` to *out_state*.
+            5. Save :class:`~state.HabitatState` (includes ``features.parquet``).
 
         Args:
-            img_dir: Directory of input NIfTI images.
-            mask_dir: Directory of corresponding binary masks.
+            seq_dirs: ``{sequence_name: image_dir}`` mapping, or a single
+                image directory path (treated as ``{"image": path}``).
+            mask_dir: Directory of binary mask NIfTI files.
             out_state: Destination path for the state archive (``.zip``).
+            io_manager: Optional :class:`~io_manager.HabitatIOManager` to
+                receive voxel provenance records.  A temporary one is created
+                internally if not supplied.
+            extra_metadata: Extra key/value pairs merged into ``metadata.json``.
+            skip_norm: If ``True``, assume *seq_dirs* already contain
+                normalised images and skip normaliser training and application.
+                An empty normaliser state is stored in the archive.
 
         Returns:
-            The saved :class:`~state.HabitatState`.
+            The saved and re-loaded :class:`~state.HabitatState`.
         """
-        img_dir = Path(img_dir)
+        seq_dirs = self._resolve_seq_dirs(seq_dirs)
         mask_dir = Path(mask_dir)
         out_state = Path(out_state)
+        seq_names = list(seq_dirs.keys())
+
+        # Use caller's IO manager or create an internal one for provenance
+        own_manager = io_manager is None
+        if own_manager:
+            io_manager = HabitatIOManager(
+                pipeline=self,
+                sequence_paths=seq_dirs,
+                segmentation_path=mask_dir,
+                id_globber=self.id_globber,
+            )
 
         normalizer = HabitatNormalizer(self.norm_config, self.id_globber)
         extractor = PixelwiseFeatureExtractor(self.pyrad_config)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
-            norm_state_dir = tmp / "norm_state"
-            norm_img_dir = tmp / "norm_images"
+        with tempfile.TemporaryDirectory() as _tmp:
+            tmp = Path(_tmp)
 
-            # Step 1: Train normaliser
-            logger.info("=== Step 1/4: Training normaliser ===")
-            normalizer.train(img_dir, mask_dir, norm_state_dir)
+            norm_state_dirs: Dict[str, Path] = {}
 
-            # Step 2: Apply normalisation
-            logger.info("=== Step 2/4: Applying normalisation ===")
-            normalizer.infer(img_dir, norm_img_dir, norm_state_dir, mask_dir=mask_dir)
+            if skip_norm:
+                logger.info("=== Steps 1–2/4: Skipping normalisation (--skip-norm) ===")
+                for seq in seq_names:
+                    empty_dir = tmp / f"norm_state_{seq}"
+                    empty_dir.mkdir()
+                    norm_state_dirs[seq] = empty_dir
+                norm_img_dirs: Dict[str, Path] = dict(seq_dirs)
+            else:
+                # Step 1: Train one normaliser per sequence
+                logger.info(f"=== Step 1/4: Training normalisers ({seq_names}) ===")
+                for seq, img_dir in seq_dirs.items():
+                    nsd = tmp / f"norm_state_{seq}"
+                    normalizer.train(img_dir, mask_dir, nsd)
+                    norm_state_dirs[seq] = nsd
 
-            # Step 3: Extract features
-            logger.info("=== Step 3/4: Extracting pixelwise features ===")
-            pairs = _match_pairs(norm_img_dir, mask_dir, self.id_globber)
+                # Step 2: Apply normalisation for each sequence
+                logger.info("=== Step 2/4: Applying normalisation ===")
+                norm_img_dirs = {}
+                for seq, img_dir in seq_dirs.items():
+                    nid = tmp / f"norm_images_{seq}"
+                    normalizer.infer(img_dir, nid, norm_state_dirs[seq], mask_dir=mask_dir)
+                    norm_img_dirs[seq] = nid
+
+            # Step 3: Multi-sequence feature extraction
+            logger.info("=== Step 3/4: Extracting multi-sequence pixelwise features ===")
+            common_ids, seq_by_id, mask_by_id = _common_ids(
+                norm_img_dirs, mask_dir, self.id_globber
+            )
+            if max_cases is not None:
+                common_ids = common_ids[:max_cases]
+                logger.info(f"Debug: limiting to {len(common_ids)} cases.")
+
             all_features: List[np.ndarray] = []
+            column_labels: List[str] = []
 
-            for img_path, mask_path in tqdm(pairs, desc="Feature extraction"):
+            for case_id in track(common_ids, description="[cyan]Feature extraction"):
                 try:
-                    feats, indices, _ = extractor.extract_from_files(img_path, mask_path)
+                    images = {
+                        seq: sitk.ReadImage(str(seq_by_id[case_id][seq]), sitk.sitkFloat32)
+                        for seq in seq_names
+                    }
+                    mask_sitk = sitk.ReadImage(str(mask_by_id[case_id]), sitk.sitkUInt8)
+
+                    feats, indices, col_lbls = extractor.extract_multi_sequence(images, mask_sitk)
                     all_features.append(feats)
-                    if io_manager is not None:
-                        seq_name = next(iter(io_manager.sequence_names), "image")
-                        io_manager.register(
-                            sequence_paths={seq_name: img_path},
-                            segmentation_path=mask_path,
-                            voxel_indices=indices,
-                            column_labels=[f"{seq_name}__{f}" for f in extractor.column_labels_],
-                        )
+                    if not column_labels:
+                        column_labels = col_lbls
+
+                    io_manager.register(
+                        sequence_paths=seq_by_id[case_id],
+                        segmentation_path=mask_by_id[case_id],
+                        voxel_indices=indices,
+                        column_labels=col_lbls,
+                    )
                 except Exception as exc:
-                    logger.warning(f"Skipping {img_path.name}: {exc}")
+                    logger.warning(f"Skipping '{case_id}': {exc}")
 
             if not all_features:
                 raise RuntimeError("No feature matrices were produced. Check input data.")
 
             X = np.concatenate(all_features, axis=0)
-            logger.info(f"Combined feature matrix: {X.shape[0]} voxels × {X.shape[1]} filters")
+            logger.info(f"Combined feature matrix: {X.shape[0]} voxels × {X.shape[1]} features")
 
             # Step 4: Cluster
             logger.info("=== Step 4/4: Clustering ===")
@@ -175,20 +298,55 @@ class HabitatPipeline:
             clusterer.fit(X)
             logger.info(f"\n{clusterer.metrics_summary()}")
 
-            # Save clusterer and build state
+            # Build feature DataFrame for archiving (includes cluster labels)
+            features_df = build_features_df(X, io_manager, column_labels)
+            all_labels = clusterer.predict(X).astype(np.int32)
+            features_df["cluster"] = all_labels
+
+            # Save state (must happen before segmentation write — state.save() may
+            # rmtree the output directory if it already exists as a plain dir)
             clusterer_path = tmp / "clusterer.joblib"
             clusterer.save(clusterer_path)
 
             state = HabitatState.from_parts(
                 clusterer_path=clusterer_path,
                 pyrad_config_path=self.pyrad_config,
-                norm_state_path=norm_state_dir,
+                norm_state_paths=norm_state_dirs,
                 best_k=clusterer.best_k,
                 metrics=clusterer.metrics,
-                extra={"cluster_method": self.cluster_method, "k_range": self.k_range,
-                       **(extra_metadata or {})},
+                extra={
+                    "cluster_method": self.cluster_method,
+                    "k_range": self.k_range,
+                    "sequences": seq_names,
+                    "feature_columns": column_labels,
+                    "skip_norm": skip_norm,
+                    **(extra_metadata or {}),
+                },
             )
-            state.save(out_state)
+            state.save(out_state, features_df=features_df)
+
+            # Write per-case habitat segmentations (after state.save so the
+            # output directory is not wiped underneath us)
+            if out_seg_dir is not None:
+                seg_dir = Path(out_seg_dir)
+                seg_dir.mkdir(parents=True, exist_ok=True)
+                logger.info(f"Writing segmentations to {seg_dir}")
+                for case_id, rec in io_manager.records.items():
+                    case_labels = all_labels[rec.row_start:rec.row_end]
+                    mask_sitk = sitk.ReadImage(str(rec.segmentation_path), sitk.sitkUInt8)
+                    mask_array = sitk.GetArrayFromImage(mask_sitk)
+                    label_array = np.zeros_like(mask_array, dtype=np.int32)
+                    label_array[
+                        rec.voxel_indices[:, 0],
+                        rec.voxel_indices[:, 1],
+                        rec.voxel_indices[:, 2],
+                    ] = case_labels
+                    label_sitk = sitk.GetImageFromArray(label_array)
+                    label_sitk.CopyInformation(mask_sitk)
+                    out_path = seg_dir / f"{case_id}_habitat.nii.gz"
+                    sitk.WriteImage(label_sitk, str(out_path))
+                    logger.info(f"Written: {out_path.absolute()}")
+                logger.info(f"Segmentations written to {seg_dir}")
 
         logger.info(f"Training complete. State saved to {out_state}")
         return HabitatState.load(out_state)
@@ -199,63 +357,116 @@ class HabitatPipeline:
 
     def infer(
         self,
-        img_dir: Union[str, Path],
+        seq_dirs: Union[Dict[str, Union[str, Path]], str, Path],
         mask_dir: Union[str, Path],
         state_path: Union[str, Path],
         out_dir: Union[str, Path],
         visualize: bool = True,
-        io_manager=None,
+        io_manager: Optional[HabitatIOManager] = None,
+        skip_norm: bool = False,
+        max_cases: Optional[int] = None,
     ) -> List[Path]:
-        """Apply a trained pipeline to new images and write habitat segmentations.
+        """Apply a trained pipeline to new data and write habitat segmentations.
+
+        For each case the pipeline:
+        1. Checks whether cached features exist in the state archive.
+        2. If not, normalises *(unless skip_norm)* and extracts features.
+        3. Predicts cluster labels and writes NIfTI + optional PNG overlays.
 
         Args:
-            img_dir: Directory of input NIfTI images.
-            mask_dir: Directory of corresponding binary masks.
+            seq_dirs: ``{sequence_name: image_dir}`` or a single image dir.
+            mask_dir: Directory of binary mask NIfTI files.
             state_path: Path to the ``.zip`` state archive.
-            out_dir: Directory to write output files.
-            visualize: If True, write PNG overlay images alongside NIfTI outputs.
+            out_dir: Directory for output label maps and overlays.
+            visualize: Write PNG overlay images alongside NIfTI outputs.
+            io_manager: Optional :class:`~io_manager.HabitatIOManager` to
+                receive voxel provenance records for inferred cases.
+            skip_norm: If ``True``, assume *seq_dirs* already contain
+                normalised images and skip the normalisation step.
 
         Returns:
-            List of paths to the output NIfTI label maps.
+            List of output NIfTI label-map paths.
         """
-        img_dir = Path(img_dir)
+        seq_dirs = self._resolve_seq_dirs(seq_dirs)
         mask_dir = Path(mask_dir)
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
+        own_manager = io_manager is None
+        if own_manager:
+            io_manager = HabitatIOManager(
+                pipeline=self,
+                sequence_paths=seq_dirs,
+                segmentation_path=mask_dir,
+                id_globber=self.id_globber,
+            )
 
-            # Load state
+        with tempfile.TemporaryDirectory() as _tmp:
+            tmp = Path(_tmp)
+
             state = HabitatState.load(state_path, extract_dir=tmp / "state")
             clusterer = HabitatClusterer.load(state.clusterer_path)
             extractor = PixelwiseFeatureExtractor(state.pyrad_config_path)
             normalizer = HabitatNormalizer(self.norm_config, self.id_globber)
 
-            # Normalise images
-            logger.info("Normalising images...")
-            norm_img_dir = tmp / "norm_images"
-            normalizer.infer(img_dir, norm_img_dir, state.norm_state_path, mask_dir=mask_dir)
+            if skip_norm:
+                logger.info("Skipping normalisation (--skip-norm).")
+                norm_img_dirs: Dict[str, Path] = dict(seq_dirs)
+            else:
+                logger.info("Normalising input sequences...")
+                norm_img_dirs = {}
+                for seq, img_dir in seq_dirs.items():
+                    nid = tmp / f"norm_images_{seq}"
+                    norm_state = state.norm_state_paths.get(seq, state.norm_state_path)
+                    normalizer.infer(img_dir, nid, norm_state, mask_dir=mask_dir)
+                    norm_img_dirs[seq] = nid
 
-            pairs = _match_pairs(norm_img_dir, mask_dir, self.id_globber)
+            common_ids, seq_by_id, mask_by_id = _common_ids(
+                norm_img_dirs, mask_dir, self.id_globber
+            )
+            if max_cases is not None:
+                common_ids = common_ids[:max_cases]
+                logger.info(f"Debug: limiting to {len(common_ids)} cases.")
+
             output_paths: List[Path] = []
 
-            for img_path, mask_path in tqdm(pairs, desc="Inference"):
-                case_id = img_path.stem.replace(".nii", "")
+            for case_id in track(common_ids, description="[cyan]Inference"):
                 try:
-                    feats, voxel_indices, image = extractor.extract_from_files(img_path, mask_path)
-                    if io_manager is not None:
-                        seq_name = next(iter(io_manager.sequence_names), "image")
-                        io_manager.register(
-                            sequence_paths={seq_name: img_path},
-                            segmentation_path=mask_path,
-                            voxel_indices=voxel_indices,
-                            column_labels=[f"{seq_name}__{f}" for f in extractor.column_labels_],
+                    # --- Attempt to reuse cached training features ---
+                    cached = state.get_case_features(case_id)
+                    if cached is not None:
+                        logger.info(f"Using cached features for '{case_id}'.")
+                        feats = cached[
+                            [c for c in cached.columns if c not in {"case_id", "z", "y", "x", "cluster"}]
+                        ].values.astype(np.float16)
+                        voxel_indices = cached[["z", "y", "x"]].values.astype(int)
+                        # Load image geometry from first sequence for NIfTI writing
+                        image = sitk.ReadImage(
+                            str(seq_by_id[case_id][next(iter(seq_dirs))]),
+                            sitk.sitkFloat32,
                         )
+                    else:
+                        images = {
+                            seq: sitk.ReadImage(str(seq_by_id[case_id][seq]), sitk.sitkFloat32)
+                            for seq in seq_dirs
+                        }
+                        mask_sitk = sitk.ReadImage(str(mask_by_id[case_id]), sitk.sitkUInt8)
+                        feats, voxel_indices, col_lbls = extractor.extract_multi_sequence(
+                            images, mask_sitk
+                        )
+                        image = next(iter(images.values()))
+
+                    io_manager.register(
+                        sequence_paths=seq_by_id[case_id],
+                        segmentation_path=mask_by_id[case_id],
+                        voxel_indices=voxel_indices,
+                        column_labels=state.metadata.get("feature_columns"),
+                    )
+
                     labels = clusterer.predict(feats)
 
-                    # Build 3-D label volume
-                    mask_sitk = sitk.ReadImage(str(mask_path), sitk.sitkUInt8)
+                    # Reconstruct 3-D label volume
+                    mask_sitk = sitk.ReadImage(str(mask_by_id[case_id]), sitk.sitkUInt8)
                     mask_array = sitk.GetArrayFromImage(mask_sitk)
                     label_array = np.zeros_like(mask_array, dtype=np.int32)
                     label_array[
@@ -265,16 +476,18 @@ class HabitatPipeline:
                     ] = labels
 
                     nifti_path = out_dir / f"{case_id}_habitat.nii.gz"
-                    label_map_to_nifti(label_array, image, nifti_path)
+                    label_map_to_nifti(label_array, mask_sitk, nifti_path)
                     output_paths.append(nifti_path)
 
                     if visualize:
                         img_array = sitk.GetArrayFromImage(image)
-                        png_path = out_dir / f"{case_id}_overlay.png"
-                        render_habitat_overlay(img_array, label_array, mask_array, png_path)
+                        render_habitat_overlay(
+                            img_array, label_array, mask_array,
+                            out_dir / f"{case_id}_overlay.png",
+                        )
 
                 except Exception as exc:
-                    logger.error(f"Failed on case {case_id}: {exc}")
+                    logger.error(f"Failed on case '{case_id}': {exc}")
 
         logger.info(f"Inference complete. {len(output_paths)} cases written to {out_dir}")
         return output_paths

@@ -28,7 +28,7 @@ from sklearn.metrics import (
     silhouette_score,
 )
 from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
 from mnts.mnts_logger import MNTSLogger
 
@@ -114,7 +114,7 @@ class HabitatClusterer:
 
         self.best_k: Optional[int] = None
         self.best_model = None
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()
         self.metrics: Dict[int, Dict[str, float]] = {}
         self._is_fitted = False
 

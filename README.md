@@ -38,18 +38,13 @@ uv sync python=3.9
 ```
 │   ├── train.py                    # habitat-train entry point
 │   └── infer.py                    # habitat-infer entry point
-├── examples/
-│   ├── 01_clustering_basics.py
-│   ├── 02_feature_extraction.py
-│   ├── 03_normalization.py
-│   ├── 04_full_training_pipeline.py
-│   ├── 05_inference_pipeline.py
-│   └── 06_visualization.py
-└── tests/
-    ├── test_clusterer.py
-    ├── test_feature_extractor.py
-    ├── test_state.py
-    └── test_visualization.py
+├── Inputs/
+│   ├── T1W_TRA/*.nii.gz
+│   └── T2W_TRA/*.nii.gz
+└── Configs/
+    ├── norm_graph_t1.yaml          # can also be shared between the two images
+    ├── norm_graph_t2.yaml
+    └── pyradiomics.yaml            # Only imaging filter and preprocessing settings are respected
 ```
 
 ---
@@ -67,7 +62,7 @@ SpatialNorm (resample to 0.4492 mm in-plane)
               └─► NyulNormalizer  ← requires training & brain mask
 ```
 
-See more information in the original repo [here](https://github.com/alabamagan/mri_normalization_tools).
+Note that some of the filters might require and additional training step that is not supported by the current trianing CLI (e.g., Nyul normalization). See more information in the original repo [here](https://github.com/alabamagan/mri_normalization_tools).
 
 ### `configs/pyradiomics_habitat.yaml`
 
