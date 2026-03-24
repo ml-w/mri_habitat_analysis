@@ -18,12 +18,12 @@ import SimpleITK as sitk
 from scipy.ndimage import uniform_filter
 from mnts.mnts_logger import MNTSLogger
 
-logger = MNTSLogger[__name__]
+logger: MNTSLogger = MNTSLogger[__name__]
 
 _DEFAULT_CONFIG = Path(__file__).parent.parent / "configs" / "pyradiomics_habitat.yaml"
 
-# Convolution kernel size: [row, col, slice] — 3×3 in-plane, 1 slice
-_CONV_SIZE = [3, 3, 1]
+# Convolution kernel size: [Z, Y, X] — 1 slice, 3×3 in-plane
+_CONV_SIZE = [1, 3, 3]
 
 
 def _get_filtered_images(
@@ -55,12 +55,29 @@ def _get_filtered_images(
 
         results: List[Tuple[str, sitk.Image]] = []
         for filtered_img, _filtered_mask, out_kwargs in func(image, mask, **kwargs):
-            # Build a unique label; LoG exposes 'sigma' in out_kwargs
-            if "sigma" in out_kwargs:
-                label = f"{image_type}-sigma{out_kwargs['sigma']}"
+            # Build a unique label from any keys in out_kwargs that differ
+            # from the input kwargs (e.g. sigma for LoG, wavelet decomp name,
+            # LBP params, etc.)
+            extra = {
+                k: v for k, v in out_kwargs.items()
+                if k not in kwargs or kwargs[k] != v
+            }
+            if extra:
+                logger.info(f"extra: {out_kwargs}")
+                suffix = "-".join(f"{k}{v}" for k, v in sorted(extra.items()))
+                label = f"{image_type}-{suffix}"
             else:
                 label = image_type
             results.append((label, filtered_img))
+
+        # Safety net: if labels are still not unique, append an index
+        seen: Dict[str, int] = {}
+        for i, (label, img) in enumerate(results):
+            count = seen.get(label, 0)
+            if count > 0:
+                results[i] = (f"{label}-{count}", img)
+            seen[label] = count + 1
+
         return results
 
     except Exception as exc:
@@ -158,7 +175,7 @@ class PixelwiseFeatureExtractor:
         self,
         sequences: Dict[str, sitk.Image],
         mask: sitk.Image,
-    ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    ) -> Tuple[np.ndarray, Union[np.ndarray, None], List[str]]:
         """Extract features from multiple MRI sequences and concatenate horizontally.
 
         For each sequence, :meth:`extract` is applied, producing one block of
@@ -192,7 +209,7 @@ class PixelwiseFeatureExtractor:
 
         features = np.concatenate(all_blocks, axis=1)
         self.column_labels_ = all_labels
-        logger.debug(
+        logger.info(
             f"Multi-sequence matrix: {features.shape[0]} voxels × {features.shape[1]} features "
             f"({len(sequences)} sequences × {features.shape[1] // len(sequences)} filters)"
         )
