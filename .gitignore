@@ -1,8 +1,12 @@
 # Unrelated files
 SPECIFICATION.md
+.*
 
 # Datadir
 NPC_Radiomics
+
+# Lab
+lab
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
