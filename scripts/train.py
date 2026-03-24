@@ -96,6 +96,11 @@ def _parse_seq_option(param, values) -> dict:
     help="Maximum number of clusters to evaluate (inclusive)."
 )
 @click.option(
+    "--k-selection", default="elbow", show_default=True,
+    type=click.Choice(["elbow", "composite"]),
+    help="Strategy for selecting best k: 'elbow' (recommended) or 'composite'.",
+)
+@click.option(
     "--subsample", default=200_000, type=int, show_default=True,
     help="Max voxels for clustering fit (0 = use all)."
 )
@@ -108,8 +113,10 @@ def _parse_seq_option(param, values) -> dict:
 @click.option(
     "--seg-dir", default=None,
     type=click.Path(path_type=Path),
-    help="Directory for output habitat segmentations (default: <out>_segmentations/ or <out>/segmentations/).",
+    help="Directory for output habitat segmentations (default: <out>/clustered_labels/).",
 )
+@click.option("--no-vis", is_flag=True,
+              help="Disable cluster PCA visualization PNG.")
 @click.option("--debug", is_flag=True,
               help="Debug mode: process only the first 3 cases.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable DEBUG logging.")
@@ -123,11 +130,13 @@ def main(
     method: str,
     k_min: int,
     k_max: int,
+    k_selection: str,
     subsample: int,
     seed: int,
     id_globber: str,
     skip_norm: bool,
     seg_dir: Optional[Path],
+    no_vis: bool,
     debug: bool,
     verbose: bool,
 ):
@@ -175,8 +184,10 @@ def main(
         id_globber=id_globber,
         cluster_method=method,
         k_range=range(k_min, k_max + 1),
+        k_selection=k_selection,
         subsample=subsample if subsample > 0 else None,
         random_state=seed,
+        visualize=not no_vis,
     )
     # Default seg_dir: alongside state for zip, inside out dir otherwise
     if seg_dir is None:

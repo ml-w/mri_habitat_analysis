@@ -24,6 +24,9 @@ from .visualization import label_map_to_nifti, render_habitat_overlay
 
 from mnts.mnts_logger import MNTSLogger
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 logger: MNTSLogger = MNTSLogger[__name__]
 
 _DEFAULT_NORM_CONFIG = Path(__file__).parent.parent / "configs" / "normalization.yaml"
@@ -137,16 +140,20 @@ class HabitatPipeline:
         id_globber: str = r"^[0-9a-zA-Z]+",
         cluster_method: str = "kmeans",
         k_range=range(2, 7),
+        k_selection: str = "elbow",
         subsample: Optional[int] = 200_000,
         random_state: int = 42,
+        visualize: bool = True,
     ):
         self.norm_config = Path(norm_config) if norm_config else _DEFAULT_NORM_CONFIG
         self.pyrad_config = Path(pyrad_config) if pyrad_config else _DEFAULT_PYRAD_CONFIG
         self.id_globber = id_globber
         self.cluster_method = cluster_method
         self.k_range = list(k_range)
+        self.k_selection = k_selection
         self.subsample = subsample
         self.random_state = random_state
+        self.visualize = visualize
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -259,6 +266,7 @@ class HabitatPipeline:
             all_features: List[np.ndarray] = []
             column_labels: List[str] = []
 
+            # Get features for each image pair
             for case_id in track(common_ids, description="[cyan]Feature extraction"):
                 try:
                     images = {
@@ -292,8 +300,10 @@ class HabitatPipeline:
             clusterer = HabitatClusterer(
                 method=self.cluster_method,
                 k_range=self.k_range,
+                k_selection=self.k_selection,
                 random_state=self.random_state,
                 subsample=self.subsample,
+                visualize=self.visualize,
             )
             clusterer.fit(X)
             logger.info(f"\n{clusterer.metrics_summary()}")
@@ -325,11 +335,20 @@ class HabitatPipeline:
             )
             state.save(out_state, features_df=features_df)
 
-            # Write per-case habitat segmentations (after state.save so the
-            # output directory is not wiped underneath us)
+            # Write cluster visualization and per-case habitat segmentations.
+            # Must happen AFTER state.save() — when out_state is a plain
+            # directory, save() rmtrees it before recreating from staging.
             if out_seg_dir is not None:
                 seg_dir = Path(out_seg_dir)
                 seg_dir.mkdir(parents=True, exist_ok=True)
+
+                if clusterer.visualize:
+                    X_scaled = clusterer.scaler.transform(X.astype(np.float32))
+                    clusterer.visualize_cluster_results(
+                        X_scaled, seg_dir / f"cluster_pca_k{clusterer.best_k}.png",
+                        feature_names=column_labels,
+                    )
+
                 logger.info(f"Writing segmentations to {seg_dir}")
                 for case_id, rec in io_manager.records.items():
                     case_labels = all_labels[rec.row_start:rec.row_end]
