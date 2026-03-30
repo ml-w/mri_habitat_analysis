@@ -1,5 +1,6 @@
 # Unrelated files
 SPECIFICATION.md
+*.md
 .*
 
 # Datadir
