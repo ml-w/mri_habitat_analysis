@@ -14,18 +14,20 @@
 
 ## Introduction and motivations
 
-This repository implements a **radiomics habitat analysis pipeline** for nasopharyngeal carcinoma (NPC) on MRI.
+This repository implements a **radiomics habitat analysis pipeline**, primarily for nasopharyngeal carcinoma (NPC) on MRI, but can also applies to other modalities.
 
-Habitat analysis is an emerging radiomics technique that subdivides a tumour ROI into spatially distinct sub-regions ("habitats") based on local imaging phenotype. The approach:
+Habitat analysis is an emerging radiomics technique that subdivides a tumour ROI into spatially distinct sub-regions ("habitats") based on local imaging phenotype. The approach we adopt in this repo:
 
 1. Computes a multi-filter feature vector per voxel (using pyradiomics image filters).
 2. Clusters voxels by their feature vectors into *k* groups.
-3. Treats each cluster as an independent sub-segmentation for downstream radiomics feature extraction.
+3. Treats each cluster as an independent sub-segmentation for downstream task including classification.
+
+We see in some manuscript that the subregions are only clused by simple imaging properties (e.g., T1w/T2w plain signals) then further used for radiomics features extraction with a regular pipeline. We question this methodology here as from our experiences the clustered subregion is extremely fragmented such that the validity of the second order features become questionable (e.g., GLCM, GLRLM). Therefore, we decided to apply the radiomics imaging filter first for the clustering of habtitats, then go on to perform classification with first order features of these subregions.
 
 
 ## Quick start — CLI
 
-**Install**
+### **Install**
 
 ```bash
 git clone https://github.com/ml-w/mri_habitat_analysis
@@ -33,19 +35,112 @@ cd mri_habitat_analysis
 uv sync python=3.9
 ```
 
-**Train** on a directory of NIfTI images and masks:
+### **Train** on a directory of NIfTI images and masks:
 
-```
+```bash
 │   ├── train.py                    # habitat-train entry point
 │   └── infer.py                    # habitat-infer entry point
 ├── Inputs/
-│   ├── T1W_TRA/*.nii.gz
-│   └── T2W_TRA/*.nii.gz
+│   ├── T1W_TRA/UID123_*.nii.gz     # Images are paired with a unique ID
+│   └── T2W_TRA/UID123_*.nii.gz
+├── Segmentations/
+│   └── Shared/UID123_*.nii.gz      # Only one set of segmentations 
 └── Configs/
-    ├── norm_graph_t1.yaml          # can also be shared between the two images
-    ├── norm_graph_t2.yaml
+    ├── norm_graph.yaml             # TODO - Do not use
     └── pyradiomics.yaml            # Only imaging filter and preprocessing settings are respected
 ```
+
+Once you've got the directory readied, you can run the training script directly through the entry point `habitat-train`:
+
+```bash
+habitat-train 
+   --seq T1:inputs/T1W_TRA                   # There can be multiple sequences as inputs
+   --seq T2:inputs/T2W_TRA                   # There can be multiple sequences as inputs
+   --id-globber "UID\d+"                     # Regex for globbing the ID of the case from the file name. 
+   --out output                              # Where the results will be stored
+   --method kmeans                           # The method for clustering habitats
+   --subsample 400000                        # This will perfrom subsampling as there can be many voxels in a dataset
+   --skip-norm                               # normalization is not yet readied as part of the pipeline
+   --seg-dir Segmentations/Shared            # Directory holding the segmetnation .nii.gz files
+   --pyrad-config Configs/pyradiomics.yaml   # Setting for pyradiomics. Only those configurations for imaging filters are in effect
+   --verbose                                 # Enables DEBUG logging
+   -n                                        # Multithread for feature extraction step (doesn't affect the training step)
+```
+
+All outputs will be written to the designated output folder. If you add .zip to the suffix, it will be zipped as well. Otherwise, the output folder structure is typically this:
+
+```bash
+output/
+├── clustered_labels/               # Per-case habitat segmentation NIfTI files
+│   ├── {case_id}_habitat.nii.gz    # Label map where voxel values = cluster assignment (1..k)
+│   └── ...
+├── normaliser_state/               # Trained normalisation parameters (per sequence)
+│   ├── T1/
+│   └── T2/
+├── clusterer.joblib                # Fitted clustering pipeline (scaler + KMeans/GMM)
+├── features.parquet                # Extracted per-voxel features with case_id, coordinates, and cluster labels
+├── metadata.json                   # Best k, per-k evaluation metrics, software versions, feature columns
+└── pyradiomics_config.yaml         # Copy of the pyradiomics filter config used during training
+```
+
+Next step, you can either use the output sub-regioned segmentation (`clustered_labels`) or the already extracted and tabulated features from radiomics imaging filters (`features.parquet`) for downstream classification tasks. 
+
+For sub-regioning, the assigment of cluster class is deterministics, with the cluster code as integer classes based on the position of their centriod. So unless the fit is really bad with too few data, the output multi-class segmentation should be more or less consistent. 
+
+For `features.parquet`, each row represents one voxel, and they are associated with a case-level IDs (globbed by the provided regex). This enables you to do some voxel level analysis as the filtered images are not output for the sake of space management. 
+
+<details>
+<summary><b>Script usages</b></summary>
+
+```bash
+Usage: habitat-train [OPTIONS]
+
+  Train the habitat analysis pipeline and save the state archive.
+
+Options:
+  --seq NAME:DIR                  Sequence name:directory pair (repeatable).
+                                  E.g. --seq T1:/data/T1 --seq T2:/data/T2
+  --img-dir DIRECTORY             Single-sequence image directory (alias for
+                                  --seq image:DIR).
+  --mask-dir DIRECTORY            Directory of binary mask NIfTI files.
+                                  [required]
+  --out PATH                      Output state path — a .zip archive if the
+                                  suffix is .zip, otherwise a plain directory.
+                                  [required]
+  --norm-config FILE              mnts normalisation YAML (default: bundled).
+  --pyrad-config FILE             PyRadiomics filter YAML (default: bundled).
+  --method [kmeans|gmm]           Clustering algorithm.
+  --k-min INTEGER                 Minimum number of clusters to evaluate.
+                                  [default: 2]
+  --k-max INTEGER                 Maximum number of clusters to evaluate
+                                  (inclusive).  [default: 6]
+  --k-selection [elbow|composite]
+                                  Strategy for selecting best k: 'elbow'
+                                  (recommended) or 'composite'.  [default:
+                                  elbow]
+  --subsample INTEGER             Max voxels for clustering fit (0 = use all).
+                                  [default: 200000]
+  --seed INTEGER                  Random seed.  [default: 42]
+  --id-globber TEXT               Regex to extract case IDs from filenames.
+                                  [default: ^[0-9a-zA-Z]+]
+  --skip-norm                     Skip normalisation (use when images are
+                                  already normalised).
+  --seg-dir PATH                  Directory for output habitat segmentations
+                                  (default: <out>/clustered_labels/).
+  --no-vis                        Disable cluster PCA visualization PNG.
+  -n, --workers INTEGER           Number of parallel workers for feature
+                                  extraction.  [default: 1]
+  --y-true FILE                   CSV or XLSX file for supervised feature
+                                  selection (t-test). First column = case ID
+                                  index, second column = binary label (0/1).
+  --force-extract                 Force feature re-extraction even if cached
+                                  features.parquet exists.
+  --debug                         Debug mode: process only the first 3 cases.
+  -v, --verbose                   Enable DEBUG logging.
+  --help                          Show this message and exit.
+```
+
+</details>
 
 ---
 
@@ -83,11 +178,11 @@ slice independence.
 
 ---
 
-## Reproducibility
+# Inference
 
-All hyperparameters and trained artefacts are bundled in the `.zip` state archive:
+All hyperparameters and trained artefacts are bundled in the output folder created by the training script:
 
-- Trained NyulNormalizer parameters
+- TODO: Trained NyulNormalizer parameters 
 - PyRadiomics filter config (YAML)
 - Fitted clusterer (joblib)
 - Metadata JSON: best k, per-k evaluation scores, software versions
