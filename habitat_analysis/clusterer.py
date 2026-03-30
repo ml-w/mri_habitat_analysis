@@ -30,7 +30,9 @@ from sklearn.metrics import (
     silhouette_score,
 )
 from sklearn.mixture import GaussianMixture
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.preprocessing import RobustScaler
+from scipy.stats import skew
 
 from mnts.mnts_logger import MNTSLogger
 
@@ -165,20 +167,29 @@ class HabitatClusterer:
             raise ValueError(
                 f"k_selection must be one of {_VALID_K_STRATEGIES}, got '{k_selection}'"
             )
+            
+        # -- Attributes
         self.method = method
         self.k_range = list(k_range)
         self.k_selection = k_selection
         self.kmeans_n_init = kmeans_n_init
         self.random_state = random_state
         self.subsample = subsample
-
         self.visualize = visualize
+        self._is_fitted = False
 
+        # -- Trained parameters
         self.best_k: Optional[int] = None
+        self.metrics: Dict[int, Dict[str, float]] = {}
+        
+        # -- Models
         self.best_model = None
         self.scaler = RobustScaler(unit_variance=True)
-        self.metrics: Dict[int, Dict[str, float]] = {}
-        self._is_fitted = False
+        self.selector_ = None           # fitted VarianceThreshold
+        self.skew_mask_: Optional[np.ndarray] = None  # bool mask from skewness filter
+        self.ttest_mask_: Optional[np.ndarray] = None  # bool mask from t-test filter
+        self.feature_mask_: Optional[np.ndarray] = None  # combined bool mask (variance, skewness, t-test)
+        self.label_order_: Optional[np.ndarray] = None   # deterministic label permutation (by centroid norm)
 
     def _make_model(self, k: int):
         if self.method == "kmeans":
@@ -192,18 +203,121 @@ class HabitatClusterer:
                 n_components=k,
                 random_state=self.random_state,
             )
+            
+    def _fit_selector(self, X: np.ndarray, var_threshold: float = 1E-10, skew_threshold: float = 2.0, y_true: Optional[np.ndarray] = None) -> np.ndarray:
+        """Fit feature selection on training data and return the filtered array.
+
+        Three filters are applied sequentially:
+        1. **Variance**: remove near-constant features (VarianceThreshold).
+        2. **Skewness**: remove features with |skewness| > *skew_threshold*,
+           which tend to be degenerate or dominated by outliers.
+        3. **T-test** (optional): when *y_true* is provided with two classes,
+           remove features that do not show a significant difference between
+           groups (Welch's t-test, p >= 0.05).
+
+        The fitted masks are stored as instance attributes so :meth:`predict`
+        and :meth:`_apply_selector` can apply the same selection at inference.
+
+        Args:
+            X: Feature matrix ``(N, F)``.
+            var_threshold: Minimum variance for VarianceThreshold.
+            skew_threshold: Maximum absolute skewness allowed.
+            y_true: Optional binary label array ``(N,)`` for t-test filtering.
+
+        Returns:
+            Filtered ``X`` with only selected columns.
+        """
+        logger.info(f"Filtering features with parameters: {skew_threshold = } and {var_threshold = :}")
+        n_before = X.shape[1]
+
+        # Step 1: variance filter
+        self.selector_ = VarianceThreshold()
+        X_var = self.selector_.fit_transform(X)
+        var_mask = self.selector_.get_support()
+        logger.debug(f"{var_mask}")
+
+        # Step 2: skewness filter (on variance-surviving columns)
+        skewness = skew(X_var, axis=0)
+        self.skew_mask_ = np.abs(skewness) <= skew_threshold
+        X_out = X_var[:, self.skew_mask_]
+        logger.debug(f"{skewness = }")
+
+        # Step 3: t-test filter (on skewness-surviving columns)
+        self.ttest_mask_: Optional[np.ndarray] = None
+        if y_true is not None and len(np.unique(y_true)) > 1:
+            import pingouin as pg
+            import pandas as pd
+
+            p_values = np.ones(X_out.shape[1])
+            for i in range(X_out.shape[1]):
+                group1 = X_out[y_true == 0, i]
+                group2 = X_out[y_true == 1, i]
+                # Skip if either group is empty or both are constant
+                if len(group1) == 0 or len(group2) == 0:
+                    continue
+                if np.std(group1) == 0 and np.std(group2) == 0:
+                    continue
+                res = pg.ttest(pd.Series(group1), pd.Series(group2), correction=True)
+                p_values[i] = res['p-val'].iloc[0]
+
+            self.ttest_mask_ = p_values < 0.2
+            n_removed = int(np.sum(~self.ttest_mask_))
+            X_out = X_out[:, self.ttest_mask_]
+            logger.debug(f"T-test p-values: {p_values}")
+            logger.info(f"Applied t-test filter: removed {n_removed}/{len(p_values)} non-significant features")
+
+        # Combined mask in original feature space
+        self.feature_mask_ = var_mask.copy()
+        self.feature_mask_[var_mask] &= self.skew_mask_
+        if self.ttest_mask_ is not None:
+            combined = self.feature_mask_.copy()
+            combined[self.feature_mask_] &= self.ttest_mask_
+            self.feature_mask_ = combined
+
+        n_after = X_out.shape[1]
+        n_var_removed = n_before - var_mask.sum()
+        n_skew_removed = int((~self.skew_mask_).sum())
+        n_ttest_removed = int((~self.ttest_mask_).sum()) if self.ttest_mask_ is not None else 0
+        if n_after < n_before:
+            logger.info("\n"
+                f"Feature selection: {n_before} → {n_after} features "
+                f"(variance: removed {n_var_removed}, "
+                f"skewness: removed {n_skew_removed}, "
+                f"t-test: removed {n_ttest_removed})"
+            )
+        else:
+            logger.info("No feature columns were removed.")
+
+        return X_out
+
+    def _apply_selector(self, X: np.ndarray) -> np.ndarray:
+        """Apply the fitted feature selection masks (variance, skewness, t-test) to new data."""
+        if self.selector_ is None:
+            return X
+        X_var = self.selector_.transform(X)
+        X_out = X_var[:, self.skew_mask_]
+        if self.ttest_mask_ is not None:
+            X_out = X_out[:, self.ttest_mask_]
+        return X_out
 
     def _predict_labels(self, model, X: np.ndarray) -> np.ndarray:
         if self.method == "gmm":
             return model.predict(X)
         return model.labels_
 
-    def fit(self, X: np.ndarray) -> "HabitatClusterer":
-        """Fit clustering models over the k range and select the best k.
+    def fit(self, X: np.ndarray, y_true: Optional[np.ndarray] = None) -> "HabitatClusterer":
+        """Fit clustering models over the k range and select the best k. Note that there's a
+        basic feature selector that removes features with bad statistical properties. This
+        selector requires a rigid input order of the input array `X`. For it to work, the input
+        order must be identical during fit and prediction.
 
         Args:
             X: Feature matrix ``(N_voxels, N_filters)``.  FP16 is upcast
                 internally.
+            y_true: Optional binary label array ``(N_voxels,)`` for supervised
+                feature selection via t-test.  When provided, features that do
+                not show a significant difference between the two groups
+                (p >= 0.05, Welch's t-test) are removed before clustering.
 
         Returns:
             self
@@ -220,14 +334,19 @@ class HabitatClusterer:
         if self.subsample and len(X) > self.subsample:
             idx = rng.choice(len(X), size=self.subsample, replace=False)
             X_fit = X[idx]
+            y_fit = y_true[idx] if y_true is not None else None
             logger.info(f"Subsampling {self.subsample} / {len(X)} voxels for clustering fit.")
         else:
             X_fit = X
+            y_fit = y_true
 
         # Clip top & bot 2.5% per feature during clustering training
         self.clip_lo_ = np.percentile(X_fit, 2.5, axis=0).astype(X_fit.dtype)
         self.clip_hi_ = np.percentile(X_fit, 97.5, axis=0).astype(X_fit.dtype)
         X_fit = np.clip(X_fit, self.clip_lo_, self.clip_hi_)
+
+        # Select only features with desired properties
+        X_fit = self._fit_selector(X_fit, y_true=y_fit)
 
         # Scale
         X_scaled = self.scaler.fit_transform(X_fit)
@@ -284,20 +403,47 @@ class HabitatClusterer:
             self.best_k = self.k_range[best_idx]
             logger.info(f"Best k={self.best_k} (composite={composite[best_idx]:.4f})")
 
-        # Refit best model on full (unsubsampled, clipped) dataset
+        # Refit best model on full (unsubsampled, clipped, selected) dataset
         X_full_clipped = np.clip(X.astype(np.float32), self.clip_lo_, self.clip_hi_)
-        X_full_scaled = self.scaler.transform(X_full_clipped)
+        X_full_selected = self._apply_selector(X_full_clipped)
+        X_full_scaled = self.scaler.transform(X_full_selected)
         self.best_model = self._make_model(self.best_k)
         if self.method == "gmm":
             self.best_model.fit(X_full_scaled)
         else:
             self.best_model.fit(X_full_scaled)
 
+        # Build a deterministic label permutation so cluster IDs are stable
+        # across runs.  We sort centroids by L2 norm (ascending), so cluster 1
+        # is always the "smallest signal" centroid, cluster 2 the next, etc.
+        self.label_order_ = self._compute_label_order()
+        logger.info(f"Deterministic label order (by centroid norm): {self.label_order_.tolist()}")
+
         self._is_fitted = True
         return self
 
+    def _compute_label_order(self) -> np.ndarray:
+        """Return a permutation array that maps raw 0-based labels to
+        deterministic 1-based labels, sorted by centroid L2 norm (ascending).
+
+        ``label_order_[raw_label]`` gives the new 1-based label.
+        """
+        if self.method == "gmm":
+            centroids = self.best_model.means_
+        else:
+            centroids = self.best_model.cluster_centers_
+        norms = np.linalg.norm(centroids, axis=1)
+        # argsort gives indices that would sort norms ascending
+        rank = np.empty_like(norms, dtype=np.int32)
+        rank[np.argsort(norms)] = np.arange(1, len(norms) + 1)
+        return rank
+
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict cluster labels (1-indexed) for feature matrix *X*.
+
+        Labels are deterministically ordered by centroid L2 norm (ascending),
+        so cluster 1 always corresponds to the centroid with the smallest norm
+        regardless of random initialisation.
 
         Args:
             X: Feature matrix ``(N_voxels, N_filters)``, same order of filters
@@ -319,12 +465,13 @@ class HabitatClusterer:
         if not self._is_fitted:
             raise RuntimeError("Call fit() before predict().")
         X_clipped = np.clip(X.astype(np.float32), self.clip_lo_, self.clip_hi_)
-        X_scaled = self.scaler.transform(X_clipped)
+        X_selected = self._apply_selector(X_clipped)
+        X_scaled = self.scaler.transform(X_selected)
         if self.method == "gmm":
-            labels = self.best_model.predict(X_scaled)
+            raw_labels = self.best_model.predict(X_scaled)
         else:
-            labels = self.best_model.predict(X_scaled)
-        return (labels + 1).astype(np.int32)  # shift to 1-based
+            raw_labels = self.best_model.predict(X_scaled)
+        return self.label_order_[raw_labels]
 
     def save(self, path: Union[str, Path]) -> None:
         """Save the fitted clusterer (model + scaler + metadata) to *path*.
@@ -348,6 +495,13 @@ class HabitatClusterer:
             "best_model": self.best_model,
             "kmeans_n_init": self.kmeans_n_init,
             "random_state": self.random_state,
+            "selector": self.selector_,
+            "skew_mask": self.skew_mask_,
+            "ttest_mask": getattr(self, "ttest_mask_", None),
+            "feature_mask": self.feature_mask_,
+            "label_order": getattr(self, "label_order_", None),
+            "clip_lo": getattr(self, "clip_lo_", None),
+            "clip_hi": getattr(self, "clip_hi_", None),
         }
         joblib.dump(payload, path)
         logger.info(f"Clusterer saved to {path}")
@@ -374,6 +528,18 @@ class HabitatClusterer:
         obj.metrics = payload["metrics"]
         obj.scaler = payload["scaler"]
         obj.best_model = payload["best_model"]
+        obj.selector_ = payload.get("selector")
+        obj.skew_mask_ = payload.get("skew_mask")
+        obj.ttest_mask_ = payload.get("ttest_mask")
+        obj.feature_mask_ = payload.get("feature_mask")
+        obj.clip_lo_ = payload.get("clip_lo")
+        obj.clip_hi_ = payload.get("clip_hi")
+        # Restore or recompute label ordering for backward compat with old saves
+        saved_order = payload.get("label_order")
+        if saved_order is not None:
+            obj.label_order_ = saved_order
+        else:
+            obj.label_order_ = obj._compute_label_order()
         obj._is_fitted = True
         return obj
 

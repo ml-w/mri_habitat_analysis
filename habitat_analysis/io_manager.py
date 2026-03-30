@@ -54,7 +54,7 @@ import numpy as np
 from mnts.mnts_logger import MNTSLogger
 from mnts.utils import get_unique_IDs
 
-logger = MNTSLogger[__name__]
+logger: MNTSLogger = MNTSLogger[__name__]
 
 
 # ---------------------------------------------------------------------------
