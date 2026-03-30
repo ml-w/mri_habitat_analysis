@@ -93,13 +93,15 @@ def _parse_seq_option(param, values) -> dict:
               help="Disable PNG overlay generation.")
 @click.option("--override", is_flag=True,
               help="Skip sequence validation against training metadata.",)
+@click.option("--workers", "-j", default=1, type=int, show_default=True,
+              help="Number of parallel workers for inference.")
 @click.option("--debug", is_flag=True,
               help="Debug mode: process only the first 3 cases.")
 @click.option("--id-globber", default=r"^[0-9a-zA-Z]+", show_default=True,
               help="Regex to extract case IDs from filenames.")
 @click.option("--verbose", "-v", is_flag=True, help="Enable DEBUG logging.")
 def main(seq_tokens, img_dir, mask_dir, state, out, norm_config,
-         skip_norm, no_vis, override, debug, id_globber, verbose):
+         skip_norm, no_vis, override, workers, debug, id_globber, verbose):
     """Run habitat analysis inference using a trained state archive."""
     from mnts.mnts_logger import MNTSLogger
     MNTSLogger("habitat_infer.log", logger_name="habitat_infer",
@@ -177,6 +179,7 @@ def main(seq_tokens, img_dir, mask_dir, state, out, norm_config,
         visualize=not no_vis,
         skip_norm=skip_norm,
         max_cases=3 if debug else None,
+        n_workers=workers,
     )
 
     if use_zip and _tmp_ctx is not None:
