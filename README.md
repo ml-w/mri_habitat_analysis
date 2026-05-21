@@ -5,7 +5,6 @@
 [![Python](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![PyRadiomics](https://img.shields.io/badge/PyRadiomics-enabled-orange.svg)](https://pyradiomics.readthedocs.io/)
 
 </div>
@@ -22,7 +21,11 @@ Habitat analysis is an emerging radiomics technique that subdivides a tumour ROI
 2. Clusters voxels by their feature vectors into *k* groups.
 3. Treats each cluster as an independent sub-segmentation for downstream task including classification.
 
-We see in some manuscript that the subregions are only clused by simple imaging properties (e.g., T1w/T2w plain signals) then further used for radiomics features extraction with a regular pipeline. We question this methodology here as from our experiences the clustered subregion is extremely fragmented such that the validity of the second order features become questionable (e.g., GLCM, GLRLM). Therefore, we decided to apply the radiomics imaging filter first for the clustering of habtitats, then go on to perform classification with first order features of these subregions.
+Here's an example of expected results: 
+
+![Example1](./img/example1.png)
+
+We see in some manuscript that the subregions are only clused by simple imaging properties (e.g., T1w/T2w plain signals) then further used for radiomics features extraction with a regular pipeline. We question this methodology here as from our experiences the clustered subregion is extremely fragmented such that the validity of the second order features become questionable (e.g., GLCM, GLRLM). Therefore, we decided to apply the radiomics imaging filter first for the clustering of habtitats, then go on to perform classification directly with first order features of these subregions.
 
 
 ## Quick start — CLI
@@ -32,7 +35,7 @@ We see in some manuscript that the subregions are only clused by simple imaging 
 ```bash
 git clone https://github.com/ml-w/mri_habitat_analysis
 cd mri_habitat_analysis
-uv sync python=3.9
+uv sync python=3.9 # pyradiomics versioning
 ```
 
 ### **Train** on a directory of NIfTI images and masks:
